@@ -15,8 +15,11 @@ set -u
 
 # ========================= 全局变量 =========================
 SCRIPT_VERSION="2.0"
+HOST_IP=$(hostname -I 2>/dev/null | awk '{print $1}' || hostname 2>/dev/null || echo "unknown")
 BACKUP_DIR="/root/security_backup/$(date +%Y%m%d_%H%M%S)"
+REPORT_DIR="/root/security_reports-${HOST_IP}"
 LOG_FILE="/var/log/security_harden.log"
+ENV_FILE=""  # 三权分立密码文件路径，运行时设置
 
 # 颜色定义
 Green="\033[32m"
@@ -394,8 +397,10 @@ harden_separation_of_duties() {
 # 创建角色用户（内部辅助函数）
 _create_role_user() {
     local username="$1" role_name="$2" role_type="$3"
-    local password_file="$BACKUP_DIR/passwords.txt"
-    mkdir -p "$BACKUP_DIR"
+
+    # 密码文件统一保存到 REPORT_DIR/.env
+    mkdir -p "$REPORT_DIR"
+    ENV_FILE="$REPORT_DIR/.env"
 
     if id "$username" &>/dev/null; then
         log_info "${role_name} ($username) 已存在，跳过创建"
@@ -432,9 +437,21 @@ _create_role_user() {
             ;;
     esac
 
-    # 密码保存到安全文件
-    echo "${role_name} - 用户名: $username  密码: $password" >> "$password_file"
-    chmod 600 "$password_file"
+    # 写入 .env 文件（KEY=VALUE 格式，方便程序读取）
+    {
+        # 首次写入时添加头部
+        if [[ ! -f "$ENV_FILE" ]]; then
+            echo "# 三权分立用户密码 - $(date '+%Y-%m-%d %H:%M:%S')"
+            echo "# 主机: $(hostname) ($HOST_IP)"
+            echo "# 首次登录后必须修改密码"
+            echo ""
+        fi
+        echo "# ${role_name}"
+        echo "${role_type^^}_USER=${username}"
+        echo "${role_type^^}_PASS=${password}"
+        echo ""
+    } >> "$ENV_FILE"
+    chmod 600 "$ENV_FILE"
 }
 
 # ========================= 6. umask 加固 =========================
@@ -1013,7 +1030,7 @@ security_check_report() {
     local format="${1:-all}"
     local timestamp
     timestamp=$(date +%Y%m%d_%H%M%S)
-    local report_dir="/root/security_reports"
+    local report_dir="$REPORT_DIR"
     mkdir -p "$report_dir"
 
     # ---- 采集数据 ----
@@ -1079,7 +1096,7 @@ security_check_report() {
 
     # [9] 监听端口
     local listen_ports
-    listen_ports=$(ss -tlnp 2>/dev/null || echo 'N/A')
+    listen_ports=$(ss -tlnp 2>/dev/null | grep -E 'LISTEN|State' | head -20 || echo 'N/A')
 
     # [10] AIDE
     local aide_installed aide_db
@@ -1091,90 +1108,329 @@ security_check_report() {
     hosts_allow_content=$(grep -v '^#' /etc/hosts.allow 2>/dev/null | grep -v '^$' || echo '(空)')
     hosts_deny_content=$(grep -v '^#' /etc/hosts.deny 2>/dev/null | grep -v '^$' || echo '(空)')
 
+    # [12] 防火墙状态
+    local firewall_status firewall_rules
+    if systemctl is-active --quiet firewalld 2>/dev/null; then
+        firewall_status="active"
+        firewall_rules=$(firewall-cmd --list-all 2>/dev/null | head -20 || echo "N/A")
+    elif systemctl is-active --quiet iptables 2>/dev/null; then
+        firewall_status="active (iptables)"
+        firewall_rules=$(iptables -L -n --line-numbers 2>/dev/null | head -20 || echo "N/A")
+    else
+        firewall_status="inactive"
+        firewall_rules="N/A"
+    fi
+
+    # [13] SELinux状态
+    local selinux_status
+    selinux_status=$(getenforce 2>/dev/null || echo 'N/A')
+
+    # [14] 三权分立用户检查
+    local sep_users=""
+    for u in sysadmin shenjiadmin anquanadmin; do
+        if id "$u" &>/dev/null; then
+            local shell_u expire_u
+            shell_u=$(getent passwd "$u" | cut -d: -f7)
+            expire_u=$(chage -l "$u" 2>/dev/null | grep 'Password expires' | cut -d: -f2 || echo 'N/A')
+            sep_users="${sep_users}${u}|存在|${shell_u}|${expire_u}"$'\n'
+        else
+            sep_users="${sep_users}${u}|不存在|-|-"$'\n'
+        fi
+    done
+
+    # [15] 危险SUID文件
+    local suid_files
+    suid_files=$(find / -perm -4000 -type f 2>/dev/null | grep -vE '^/(usr/(bin|sbin|lib|libexec)|snap)/' | head -20 || echo "无")
+
+    # [16] 密码过期检查（已有用户）
+    local user_pw_info=""
+    while IFS=: read -r uname _ uid _ _ _ ushell; do
+        [[ "$ushell" =~ (nologin|false) ]] && continue
+        [[ "$uid" -lt 1000 && "$uid" -ne 0 ]] && continue
+        local pw_expire pw_lastchange
+        pw_expire=$(chage -l "$uname" 2>/dev/null | grep 'Password expires' | cut -d: -f2 | xargs || echo 'N/A')
+        pw_lastchange=$(chage -l "$uname" 2>/dev/null | grep 'Last password change' | cut -d: -f2 | xargs || echo 'N/A')
+        user_pw_info="${user_pw_info}${uname}|${uid}|${pw_lastchange}|${pw_expire}"$'\n'
+    done < /etc/passwd
+
+    # ---- 合规得分计算 ----
+    local total_checks=0 pass_checks=0 fail_checks=0
+
+    _score_check() {
+        total_checks=$((total_checks + 1))
+        if [[ "$1" == "$2" ]]; then
+            pass_checks=$((pass_checks + 1))
+        else
+            fail_checks=$((fail_checks + 1))
+        fi
+    }
+
+    # 密码策略检查
+    _score_check "${pw_max:-}" "90"
+    _score_check "${pw_min:-}" "2"
+    _score_check "${pw_len:-}" "8"
+    _score_check "${pw_warn:-}" "7"
+
+    # 审计服务检查
+    _score_check "$auditd_status" "active"
+    _score_check "$rsyslog_status" "active"
+
+    # 内核参数检查
+    for param_kv in "net.ipv4.ip_forward|0" "net.ipv4.tcp_syncookies|1" "kernel.randomize_va_space|2" \
+                    "net.ipv4.conf.all.accept_redirects|0" "net.ipv4.conf.all.rp_filter|1" "fs.suid_dumpable|0"; do
+        local _p="${param_kv%%|*}" _e="${param_kv##*|}"
+        local _v
+        _v=$(sysctl -n "$_p" 2>/dev/null || echo "N/A")
+        _score_check "$_v" "$_e"
+    done
+
+    # 文件权限检查
+    for fpair in "/etc/passwd|644" "/etc/shadow|000" "/etc/group|644" "/etc/gshadow|000" "/etc/ssh/sshd_config|600"; do
+        local _fp="${fpair%%|*}" _fe="${fpair##*|}"
+        local _fv
+        _fv=$(stat -c '%a' "$_fp" 2>/dev/null || echo "N/A")
+        _score_check "$_fv" "$_fe"
+    done
+
+    # SSH检查
+    local _ssh_root
+    _ssh_root=$(grep -i '^PermitRootLogin' /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}')
+    _score_check "${_ssh_root:-}" "no"
+    local _ssh_empty
+    _ssh_empty=$(grep -i '^PermitEmptyPasswords' /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}')
+    _score_check "${_ssh_empty:-}" "no"
+
+    # AIDE检查
+    _score_check "$aide_installed" "是"
+
+    # 防火墙检查
+    total_checks=$((total_checks + 1))
+    if [[ "$firewall_status" == "active" || "$firewall_status" == "active (iptables)" ]]; then
+        pass_checks=$((pass_checks + 1))
+    else
+        fail_checks=$((fail_checks + 1))
+    fi
+
+    # SELinux检查
+    total_checks=$((total_checks + 1))
+    if [[ "$selinux_status" == "Enforcing" || "$selinux_status" == "Permissive" ]]; then
+        pass_checks=$((pass_checks + 1))
+    else
+        fail_checks=$((fail_checks + 1))
+    fi
+
+    # 三权分立用户检查
+    for _su in sysadmin shenjiadmin anquanadmin; do
+        total_checks=$((total_checks + 1))
+        if id "$_su" &>/dev/null; then
+            pass_checks=$((pass_checks + 1))
+        else
+            fail_checks=$((fail_checks + 1))
+        fi
+    done
+
+    local score_pct=0
+    if [[ $total_checks -gt 0 ]]; then
+        score_pct=$((pass_checks * 100 / total_checks))
+    fi
+
+    local score_level
+    if [[ $score_pct -ge 90 ]]; then score_level="优秀"
+    elif [[ $score_pct -ge 70 ]]; then score_level="良好"
+    elif [[ $score_pct -ge 50 ]]; then score_level="一般"
+    else score_level="较差"
+    fi
+
+    # ---- 生成整改建议 ----
+    local recommendations=""
+    [[ "${pw_max:-}" != "90" ]] && recommendations="${recommendations}[高] 密码最大有效期未设置为90天，当前: ${pw_max:-未配置}"$'\n'
+    [[ "${_ssh_root:-}" != "no" ]] && recommendations="${recommendations}[高] SSH允许root直接登录，建议设置 PermitRootLogin no"$'\n'
+    [[ "$firewall_status" == "inactive" ]] && recommendations="${recommendations}[高] 防火墙未启用，建议启用 firewalld 或 iptables"$'\n'
+    [[ "$aide_installed" != "是" ]] && recommendations="${recommendations}[中] AIDE完整性校验工具未安装，建议安装: yum install aide"$'\n'
+    [[ "$selinux_status" == "Disabled" ]] && recommendations="${recommendations}[中] SELinux已禁用，建议设置为 Enforcing 或 Permissive"$'\n'
+    [[ "$auditd_status" != "active" ]] && recommendations="${recommendations}[高] 审计服务 auditd 未运行，建议启动: systemctl start auditd"$'\n'
+    [[ "$rsyslog_status" != "active" ]] && recommendations="${recommendations}[中] 日志服务 rsyslog 未运行"$'\n'
+    for _su in sysadmin shenjiadmin anquanadmin; do
+        id "$_su" &>/dev/null || recommendations="${recommendations}[中] 三权分立用户 $_su 不存在，建议创建"$'\n'
+    done
+    [[ -z "$recommendations" ]] && recommendations="暂无整改建议，所有检查项均已达标。"
+
     # ---- 判定函数 ----
     _judge() {
         # 用法: _judge 当前值 期望值
         local current="$1" expected="$2"
-        if [[ "$current" == "$expected" ]]; then echo "✅ 达标"; else echo "❌ 不达标(期望:$expected)"; fi
+        if [[ "$current" == "$expected" ]]; then echo "✅ 达标"; else echo "❌ 不达标"; fi
     }
 
     # ---- 输出 TXT ----
     _gen_txt() {
         local txt_file="$report_dir/security_check_${timestamp}.txt"
+        local bar_total=10
+        local bar_filled=$((score_pct / 10))
+        local bar_empty=$((bar_total - bar_filled))
+        local progress_bar=""
+        for ((i=0; i<bar_filled; i++)); do progress_bar="${progress_bar}█"; done
+        for ((i=0; i<bar_empty; i++)); do progress_bar="${progress_bar}░"; done
+
         {
-            echo "================================================================"
-            echo "  全员人口信息系统 - 安全基线检查报告"
-            echo "  系统: $sys_name"
-            echo "  主机名: $host_name"
-            echo "  日期: $report_date"
-            echo "================================================================"
+            echo "╔══════════════════════════════════════════════════════════════╗"
+            echo "║                                                              ║"
+            echo "║          全员人口信息系统 - 安全基线检查报告                 ║"
+            echo "║                                                              ║"
+            echo "╚══════════════════════════════════════════════════════════════╝"
+            echo ""
+            echo "┌───────────────── 合规概览 (COMPLIANCE OVERVIEW) ──────────────┐"
+            printf "│  %-12s : %-44s │\n" "系统名称" "$sys_name"
+            printf "│  %-12s : %-44s │\n" "主机名称" "$host_name"
+            printf "│  %-12s : %-44s │\n" "检查时间" "$report_date"
+            printf "│  %-12s : [%-10s] %3d%% (%-8s)                │\n" "合规得分" "$progress_bar" "$score_pct" "$score_level"
+            printf "│  %-12s : 共 %-2d 项  |  ✅ 达标: %-2d  |  ❌ 未达标: %-2d      │\n" "检查统计" "$total_checks" "$pass_checks" "$fail_checks"
+            echo "└──────────────────────────────────────────────────────────────┘"
             echo ""
 
-            echo "[1] 密码策略"
-            printf "  %-18s %-10s %s\n" "PASS_MAX_DAYS" "${pw_max:-N/A}" "$(_judge "${pw_max:-}" "90")"
-            printf "  %-18s %-10s %s\n" "PASS_MIN_DAYS" "${pw_min:-N/A}" "$(_judge "${pw_min:-}" "2")"
-            printf "  %-18s %-10s %s\n" "PASS_MIN_LEN"  "${pw_len:-N/A}" "$(_judge "${pw_len:-}" "8")"
-            printf "  %-18s %-10s %s\n" "PASS_WARN_AGE" "${pw_warn:-N/A}" "$(_judge "${pw_warn:-}" "7")"
-            echo "  pam_pwquality: $pw_quality"
+            echo "┌─ [01] 密码策略 (Password Policy) ────────────────────────────┐"
+            printf "│ %-22s │ %-12s │ %-8s │ %-10s │\n" "配置项" "当前值" "期望值" "状态"
+            echo "├────────────────────────┼──────────────┼──────────┼────────────┤"
+            printf "│ %-22s │ %-12s │ %-8s │ %-10s │\n" "PASS_MAX_DAYS" "${pw_max:-N/A}" "90" "$(_judge "${pw_max:-}" "90")"
+            printf "│ %-22s │ %-12s │ %-8s │ %-10s │\n" "PASS_MIN_DAYS" "${pw_min:-N/A}" "2" "$(_judge "${pw_min:-}" "2")"
+            printf "│ %-22s │ %-12s │ %-8s │ %-10s │\n" "PASS_MIN_LEN"  "${pw_len:-N/A}" "8" "$(_judge "${pw_len:-}" "8")"
+            printf "│ %-22s │ %-12s │ %-8s │ %-10s │\n" "PASS_WARN_AGE" "${pw_warn:-N/A}" "7" "$(_judge "${pw_warn:-}" "7")"
+            echo "└────────────────────────┴──────────────┴──────────┴────────────┘"
+            echo "  备注: $pw_quality"
             echo ""
 
-            echo "[2] 登录失败锁定"
-            echo "  pam_faillock: $faillock"
-            echo "  TMOUT: $tmout_val"
+            echo "┌─ [02] 登录限制 (Login Restrictions) ─────────────────────────┐"
+            printf "│ %-25s : %-33s │\n" "pam_faillock" "$faillock"
+            printf "│ %-25s : %-33s │\n" "会话超时 (TMOUT)" "$tmout_val"
+            echo "└──────────────────────────────────────────────────────────────┘"
             echo ""
 
-            echo "[3] SSH配置"
+            echo "┌─ [03] SSH 安全配置 (SSH Security) ───────────────────────────┐"
             while IFS='|' read -r k v; do
                 [[ -z "$k" ]] && continue
-                printf "  %-24s %s\n" "$k" "$v"
+                printf "│ %-25s : %-33s │\n" "$k" "$v"
             done <<< "$ssh_items"
+            echo "└──────────────────────────────────────────────────────────────┘"
             echo ""
 
-            echo "[4] 用户账户"
-            echo "  可登录用户:"
-            echo "$login_users" | sed 's/^/    /'
-            echo "  UID=0用户: $uid0_users"
+            echo "┌─ [04] 用户账户检查 (User Accounts) ──────────────────────────┐"
+            echo "  可登录用户列表:"
+            echo "$login_users" | sed 's/^/  • /'
+            printf "  %-25s : %-33s\n" "UID=0 用户" "$uid0_users"
+            echo "└──────────────────────────────────────────────────────────────┘"
             echo ""
 
-            echo "[5] umask"
-            echo "  $umask_val"
+            echo "┌─ [05] 文件掩码 (Umask) ──────────────────────────────────────┐"
+            printf "│ %-25s : %-33s │\n" "umask 设置" "$umask_val"
+            echo "└──────────────────────────────────────────────────────────────┘"
             echo ""
 
-            echo "[6] 审计服务"
-            printf "  %-12s %s\n" "auditd:" "$auditd_status"
-            printf "  %-12s %s\n" "rsyslog:" "$rsyslog_status"
-            echo "  HISTSIZE: $histsize_val"
+            echo "┌─ [06] 安全审计 (Audit Services) ─────────────────────────────┐"
+            printf "│ %-15s : %-15s | %-24s │\n" "auditd 服务" "$auditd_status" "$(_judge "$auditd_status" "active")"
+            printf "│ %-15s : %-15s | %-24s │\n" "rsyslog 服务" "$rsyslog_status" "$(_judge "$rsyslog_status" "active")"
+            printf "│ %-15s : %-41s │\n" "HISTSIZE" "$histsize_val"
+            echo "└──────────────────────────────────────────────────────────────┘"
             echo ""
 
-            echo "[7] 文件权限"
+            echo "┌─ [07] 关键文件权限 (File Permissions) ───────────────────────┐"
+            printf "│ %-6s │ %-8s │ %-10s │ %-28s │\n" "权限" "期望" "状态" "文件路径"
+            echo "├────────┼──────────┼────────────┼──────────────────────────────┤"
             while IFS='|' read -r perm path; do
                 [[ -z "$perm" ]] && continue
-                printf "  %-6s %s\n" "$perm" "$path"
+                local exp_p="-"
+                case "$path" in
+                    */shadow|*/gshadow) exp_p="000" ;;
+                    */passwd|*/group)   exp_p="644" ;;
+                    */ssh/sshd_config)  exp_p="600" ;;
+                esac
+                printf "│ %-6s │ %-8s │ %-10s │ %-28s │\n" "$perm" "$exp_p" "$(_judge "$perm" "$exp_p")" "$path"
             done <<< "$file_perms"
+            echo "└────────┴──────────┴────────────┴──────────────────────────────┘"
             echo ""
 
-            echo "[8] 内核安全参数"
+            echo "┌─ [08] 内核安全参数 (Kernel Hardening) ───────────────────────┐"
+            printf "│ %-40s │ %-6s │ %-6s │\n" "参数名称" "值" "状态"
+            echo "├──────────────────────────────────────────┼────────┼────────┤"
             while IFS='|' read -r p v; do
                 [[ -z "$p" ]] && continue
-                printf "  %-45s = %s\n" "$p" "$v"
+                local exp_v="-"
+                case "$p" in
+                    *ip_forward|*accept_redirects|*suid_dumpable) exp_v="0" ;;
+                    *tcp_syncookies|*rp_filter) exp_v="1" ;;
+                    *randomize_va_space) exp_v="2" ;;
+                esac
+                printf "│ %-40s │ %-6s │ %-6s │\n" "$p" "$v" "$(_judge "$v" "$exp_v")"
             done <<< "$kernel_params"
+            echo "└──────────────────────────────────────────┴────────┴────────┘"
             echo ""
 
-            echo "[9] 监听端口"
-            echo "$listen_ports"
+            echo "┌─ [09] 网络监听端口 (Network Listening Ports) ────────────────┐"
+            echo "$listen_ports" | head -15 | sed 's/^/  /'
+            echo "└──────────────────────────────────────────────────────────────┘"
             echo ""
 
-            echo "[10] AIDE完整性校验"
-            echo "  安装: $aide_installed   数据库: $aide_db"
+            echo "┌─ [10] 完整性校验 (AIDE) ─────────────────────────────────────┐"
+            printf "│ %-15s : %-15s | %-24s │\n" "AIDE 安装" "$aide_installed" "$(_judge "$aide_installed" "是")"
+            printf "│ %-15s : %-41s │\n" "数据库状态" "$aide_db"
+            echo "└──────────────────────────────────────────────────────────────┘"
             echo ""
 
-            echo "[11] hosts.allow/deny"
-            echo "  hosts.allow: $hosts_allow_content"
-            echo "  hosts.deny:  $hosts_deny_content"
+            echo "┌─ [11] 访问控制列表 (hosts.allow/deny) ───────────────────────┐"
+            printf "  hosts.allow : %s\n" "$hosts_allow_content"
+            printf "  hosts.deny  : %s\n" "$hosts_deny_content"
+            echo "└──────────────────────────────────────────────────────────────┘"
+            echo ""
+
+            echo "┌─ [12] 防火墙状态 (Firewall) ─────────────────────────────────┐"
+            printf "│ %-15s : %-15s | %-24s │\n" "防火墙状态" "$firewall_status" "$([[ "$firewall_status" == "active"* ]] && echo "✅ 启用" || echo "❌ 未启用")"
+            echo "  规则预览 (前5行):"
+            echo "$firewall_rules" | head -5 | sed 's/^/  /'
+            echo "└──────────────────────────────────────────────────────────────┘"
+            echo ""
+
+            echo "┌─ [13] SELinux 状态 (Security-Enhanced Linux) ────────────────┐"
+            printf "│ %-15s : %-15s | %-24s │\n" "SELinux 模式" "$selinux_status" "$([[ "$selinux_status" != "Disabled" ]] && echo "✅ 启用" || echo "❌ 禁用")"
+            echo "└──────────────────────────────────────────────────────────────┘"
+            echo ""
+
+            echo "┌─ [14] 三权分立用户 (Separation of Duties) ───────────────────┐"
+            printf "│ %-12s │ %-8s │ %-12s │ %-20s │\n" "用户" "状态" "Shell" "密码过期时间"
+            echo "├──────────────┼──────────┼──────────────┼──────────────────────┤"
+            while IFS='|' read -r u st sh ex; do
+                [[ -z "$u" ]] && continue
+                printf "│ %-12s │ %-8s │ %-12s │ %-20s │\n" "$u" "$st" "$sh" "$ex"
+            done <<< "$sep_users"
+            echo "└──────────────┴──────────┴──────────────┴──────────────────────┘"
+            echo ""
+
+            echo "┌─ [15] 危险 SUID 文件 (SUID Files) ───────────────────────────┐"
+            echo "$suid_files" | sed 's/^/  • /'
+            echo "└──────────────────────────────────────────────────────────────┘"
+            echo ""
+
+            echo "┌─ [16] 用户密码过期信息 (Password Expiration) ────────────────┐"
+            printf "│ %-12s │ %-6s │ %-16s │ %-16s │\n" "用户名" "UID" "上次修改" "过期时间"
+            echo "├──────────────┼────────┼──────────────────┼────────────────────┤"
+            while IFS='|' read -r un uid lc ex; do
+                [[ -z "$un" ]] && continue
+                printf "│ %-12s │ %-6s │ %-16s │ %-16s │\n" "$un" "$uid" "$lc" "$ex"
+            done <<< "$user_pw_info"
+            echo "└──────────────┴────────┴──────────────────┴────────────────────┘"
+            echo ""
+
+            echo "┌─ [!] 整改建议 (Recommendations) ─────────────────────────────┐"
+            if [[ -n "$recommendations" ]]; then
+                echo "$recommendations" | sed 's/^/  /'
+            else
+                echo "  暂无整改建议，所有检查项均已达标。"
+            fi
+            echo "└──────────────────────────────────────────────────────────────┘"
             echo ""
 
             echo "================================================================"
-            echo "  检查完成"
+            echo "  报告生成时间: $report_date"
+            echo "  脚本版本: security_kylin.sh v$SCRIPT_VERSION"
+            echo "  © 2026 全员人口信息系统 - 版权所有"
             echo "================================================================"
         } | tee "$txt_file"
         log_ok "TXT 报告: $txt_file"
@@ -1183,128 +1439,199 @@ security_check_report() {
     # ---- 输出 Markdown ----
     _gen_md() {
         local md_file="$report_dir/security_check_${timestamp}.md"
-        cat > "$md_file" << MDEOF
-# 安全基线检查报告
+        local bar_filled=$((score_pct / 10))
+        local bar_empty=$((10 - bar_filled))
+        local progress_bar=""
+        for ((i=0; i<bar_filled; i++)); do progress_bar="${progress_bar}█"; done
+        for ((i=0; i<bar_empty; i++)); do progress_bar="${progress_bar}░"; done
 
-| 项目 | 值 |
-|------|------|
-| **系统** | $sys_name |
-| **主机名** | $host_name |
-| **日期** | $report_date |
+        cat > "$md_file" << MDEOF
+# 全员人口信息系统 - 安全基线检查报告
+
+## 1. 报告摘要 (Summary)
+
+| 项目 | 详细信息 |
+| :--- | :--- |
+| **操作系统** | $sys_name |
+| **主机名称** | $host_name |
+| **检查日期** | $report_date |
+| **脚本版本** | v$SCRIPT_VERSION |
+| **合规得分** | **$score_pct% ($score_level)** |
+
+**合规概览:**
+\`$progress_bar\` $score_pct% | **总项:** $total_checks | ✅ **达标:** $pass_checks | ❌ **未达标:** $fail_checks
 
 ---
 
-## 1. 密码策略
+## 2. 详细检查项 (Detailed Results)
+
+### 2.1 密码策略 (Password Policy)
 
 | 配置项 | 当前值 | 期望值 | 状态 |
-|--------|--------|--------|------|
+| :--- | :--- | :--- | :--- |
 | PASS_MAX_DAYS | ${pw_max:-N/A} | 90 | $(_judge "${pw_max:-}" "90") |
 | PASS_MIN_DAYS | ${pw_min:-N/A} | 2 | $(_judge "${pw_min:-}" "2") |
 | PASS_MIN_LEN | ${pw_len:-N/A} | 8 | $(_judge "${pw_len:-}" "8") |
 | PASS_WARN_AGE | ${pw_warn:-N/A} | 7 | $(_judge "${pw_warn:-}" "7") |
 
-**pam_pwquality**: \`$pw_quality\`
+**pam_pwquality 配置:** \`$pw_quality\`
 
-## 2. 登录失败锁定
+### 2.2 登录限制 (Login Restrictions)
 
-| 配置项 | 当前值 |
-|--------|--------|
-| pam_faillock | \`$faillock\` |
-| TMOUT | \`$tmout_val\` |
+| 配置项 | 当前值 | 状态 |
+| :--- | :--- | :--- |
+| pam_faillock | \`$faillock\` | - |
+| 会话超时 (TMOUT) | \`$tmout_val\` | - |
 
-## 3. SSH配置
+### 2.3 SSH 安全配置 (SSH Security)
 
-| 配置项 | 当前值 |
-|--------|--------|
+| 配置项 | 当前值 | 建议值 |
+| :--- | :--- | :--- |
 MDEOF
         while IFS='|' read -r k v; do
             [[ -z "$k" ]] && continue
-            echo "| $k | \`$v\` |" >> "$md_file"
+            local suggest="-"
+            case "$k" in
+                PermitRootLogin) suggest="no" ;;
+                MaxAuthTries) suggest="3" ;;
+                PermitEmptyPasswords) suggest="no" ;;
+            esac
+            echo "| $k | \`$v\` | $suggest |" >> "$md_file"
         done <<< "$ssh_items"
 
         cat >> "$md_file" << MDEOF
 
-## 4. 用户账户
+### 2.4 用户账户检查 (User Accounts)
 
 **可登录用户:**
-\`\`\`
+\`\`\`text
 $login_users
 \`\`\`
 
-**UID=0 用户:** \`$uid0_users\`
+**UID=0 用户 (特权账户):** \`$uid0_users\`
 
-## 5. umask
+### 2.5 文件掩码 (Umask)
 
-当前值: \`$umask_val\`
+**当前配置:** \`$umask_val\`
 
-## 6. 审计服务
+### 2.6 安全审计 (Audit Services)
 
-| 服务 | 状态 |
-|------|------|
-| auditd | $auditd_status |
-| rsyslog | $rsyslog_status |
+| 服务 | 状态 | 判定 |
+| :--- | :--- | :--- |
+| auditd (系统审计) | $auditd_status | $(_judge "$auditd_status" "active") |
+| rsyslog (日志服务) | $rsyslog_status | $(_judge "$rsyslog_status" "active") |
 
 **HISTSIZE:** \`$histsize_val\`
 
-## 7. 文件权限
+### 2.7 关键文件权限 (File Permissions)
 
-| 权限 | 文件路径 | 期望值 |
-|------|----------|--------|
+| 文件路径 | 权限 | 期望 | 状态 |
+| :--- | :--- | :--- | :--- |
 MDEOF
-        local expect_perm
         while IFS='|' read -r perm path; do
             [[ -z "$perm" ]] && continue
+            local exp_p="-"
             case "$path" in
-                */shadow|*/gshadow) expect_perm="000" ;;
-                */passwd|*/group)   expect_perm="644" ;;
-                */sshd_config)      expect_perm="600" ;;
-                *) expect_perm="-" ;;
+                */shadow|*/gshadow) exp_p="000" ;;
+                */passwd|*/group)   exp_p="644" ;;
+                */ssh/sshd_config)  exp_p="600" ;;
             esac
-            echo "| $perm | \`$path\` | $expect_perm |" >> "$md_file"
+            echo "| \`$path\` | $perm | $exp_p | $(_judge "$perm" "$exp_p") |" >> "$md_file"
         done <<< "$file_perms"
 
         cat >> "$md_file" << MDEOF
 
-## 8. 内核安全参数
+### 2.8 内核安全参数 (Kernel Hardening)
 
-| 参数 | 当前值 | 期望值 |
-|------|--------|--------|
+| 参数名称 | 当前值 | 期望值 | 状态 |
+| :--- | :--- | :--- | :--- |
 MDEOF
         while IFS='|' read -r p v; do
             [[ -z "$p" ]] && continue
-            local expected
+            local exp_v="-"
             case "$p" in
-                *ip_forward|*accept_redirects|*suid_dumpable) expected="0" ;;
-                *tcp_syncookies|*rp_filter) expected="1" ;;
-                *randomize_va_space) expected="2" ;;
-                *) expected="-" ;;
+                *ip_forward|*accept_redirects|*suid_dumpable) exp_v="0" ;;
+                *tcp_syncookies|*rp_filter) exp_v="1" ;;
+                *randomize_va_space) exp_v="2" ;;
             esac
-            echo "| \`$p\` | $v | $expected |" >> "$md_file"
+            echo "| \`$p\` | $v | $exp_v | $(_judge "$v" "$exp_v") |" >> "$md_file"
         done <<< "$kernel_params"
 
         cat >> "$md_file" << MDEOF
 
-## 9. 监听端口
+### 2.9 网络监听端口 (Network Ports)
 
-\`\`\`
+\`\`\`text
 $listen_ports
 \`\`\`
 
-## 10. AIDE完整性校验
+### 2.10 完整性校验 (AIDE)
 
-| 项目 | 状态 |
-|------|------|
-| 安装 | $aide_installed |
-| 数据库 | $aide_db |
+| 项目 | 状态 | 判定 |
+| :--- | :--- | :--- |
+| AIDE 安装 | $aide_installed | $(_judge "$aide_installed" "是") |
+| 数据库状态 | $aide_db | - |
 
-## 11. hosts.allow/deny
+### 2.11 访问控制 (hosts.allow/deny)
 
 - **hosts.allow:** \`$hosts_allow_content\`
 - **hosts.deny:** \`$hosts_deny_content\`
 
+### 2.12 防火墙状态 (Firewall)
+
+- **状态:** \`$firewall_status\`
+- **判定:** $( [[ "$firewall_status" == "active"* ]] && echo "✅ 启用" || echo "❌ 未启用" )
+
+**规则预览:**
+\`\`\`text
+$firewall_rules
+\`\`\`
+
+### 2.13 SELinux 状态
+
+- **模式:** \`$selinux_status\`
+- **判定:** $( [[ "$selinux_status" != "Disabled" ]] && echo "✅ 启用" || echo "❌ 禁用" )
+
+### 2.14 三权分立用户 (Separation of Duties)
+
+| 用户 | 状态 | Shell | 密码过期时间 |
+| :--- | :--- | :--- | :--- |
+MDEOF
+        while IFS='|' read -r u st sh ex; do
+            [[ -z "$u" ]] && continue
+            echo "| $u | $st | \`$sh\` | $ex |" >> "$md_file"
+        done <<< "$sep_users"
+
+        cat >> "$md_file" << MDEOF
+
+### 2.15 危险 SUID 文件
+
+\`\`\`text
+$suid_files
+\`\`\`
+
+### 2.16 用户密码过期信息
+
+| 用户名 | UID | 上次修改 | 过期时间 |
+| :--- | :--- | :--- | :--- |
+MDEOF
+        while IFS='|' read -r un uid lc ex; do
+            [[ -z "$un" ]] && continue
+            echo "| $un | $uid | $lc | $ex |" >> "$md_file"
+        done <<< "$user_pw_info"
+
+        cat >> "$md_file" << MDEOF
+
 ---
 
-> 报告由 security_kylin.sh v${SCRIPT_VERSION} 自动生成
+## 3. 整改建议 (Recommendations)
+
+$(echo "$recommendations" | sed 's/\[高\]/🔴 **[高]**/g' | sed 's/\[中\]/🟡 **[中]**/g' | sed 's/\[低\]/🟢 **[低]**/g' | awk '{print "- "$0}')
+
+---
+
+> **免责声明:** 本报告由自动化脚本生成，仅供参考。建议在生产环境执行任何修改前进行备份。
+> 生成时间: $report_date | 脚本版本: v$SCRIPT_VERSION
 MDEOF
         log_ok "Markdown 报告: $md_file"
     }
@@ -1368,11 +1695,11 @@ done <<< "$ssh_items")
 $(idx=0; while IFS='|' read -r perm path; do
     [[ -z "$perm" ]] && continue
     [[ $idx -gt 0 ]] && echo ","
-    local ep
+    ep=""
     case "$path" in
         */shadow|*/gshadow) ep="000" ;;
         */passwd|*/group)   ep="644" ;;
-        */sshd_config)      ep="600" ;;
+        */ssh/sshd_config)  ep="600" ;;
         *) ep="-" ;;
     esac
     printf '    {"perm":"%s","path":"%s","expected":"%s"}' "$perm" "$path" "$ep"
@@ -1383,7 +1710,7 @@ done <<< "$file_perms")
 $(idx=0; while IFS='|' read -r p v; do
     [[ -z "$p" ]] && continue
     [[ $idx -gt 0 ]] && echo ","
-    local exp
+    exp=""
     case "$p" in
         *ip_forward|*accept_redirects|*suid_dumpable) exp="0" ;;
         *tcp_syncookies|*rp_filter) exp="1" ;;
@@ -1399,7 +1726,37 @@ done <<< "$kernel_params")
   "hosts": {
     "allow": "$(echo "$hosts_allow_content" | tr '\n' ';' | sed 's/"/\\"/g')",
     "deny": "$(echo "$hosts_deny_content" | tr '\n' ';' | sed 's/"/\\"/g')"
-  }
+  },
+  "firewall": { "status": "$firewall_status", "rules": "$(echo "$firewall_rules" | head -20 | tr '\n' ';' | sed 's/"/\\"/g')" },
+  "selinux": "$selinux_status",
+  "sepUsers": [
+$(idx=0; while IFS='|' read -r u st sh ex; do
+    [[ -z "$u" ]] && continue
+    [[ $idx -gt 0 ]] && echo ","
+    printf '    {"user":"%s","status":"%s","shell":"%s","expire":"%s"}' "$u" "$st" "$sh" "$ex"
+    idx=$((idx+1))
+done <<< "$sep_users")
+  ],
+  "suid": "$(echo "$suid_files" | tr '\n' ';' | sed 's/"/\\"/g')",
+  "pwInfo": [
+$(idx=0; while IFS='|' read -r un uid lc ex; do
+    [[ -z "$un" ]] && continue
+    [[ $idx -gt 0 ]] && echo ","
+    printf '    {"user":"%s","uid":"%s","lastChange":"%s","expire":"%s"}' "$un" "$uid" "$lc" "$ex"
+    idx=$((idx+1))
+done <<< "$user_pw_info")
+  ],
+  "score": { "pct": $score_pct, "level": "$score_level", "pass": $pass_checks, "fail": $fail_checks, "total": $total_checks },
+  "recommendations": [
+$(idx=0; while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    [[ $idx -gt 0 ]] && echo ","
+    severity=$(echo "$line" | grep -oE '\[(高|中|低)\]' | tr -d '[]' || echo "中")
+    content=$(echo "$line" | sed 's/\[.*\] //')
+    printf '    {"severity":"%s","content":"%s"}' "$severity" "$(echo "$content" | sed 's/"/\\"/g')"
+    idx=$((idx+1))
+done <<< "$recommendations")
+  ]
 }
 JSONEOF
 
@@ -1423,12 +1780,12 @@ const failShading = { fill: "FFEBEE", type: ShadingType.CLEAR };
 function hdrCell(text, width) {
   return new TableCell({ borders, width: { size: width, type: WidthType.DXA }, shading: hdrShading, verticalAlign: VerticalAlign.CENTER,
     children: [new Paragraph({ alignment: AlignmentType.CENTER, spacing: { before: 60, after: 60 },
-      children: [new TextRun({ text, bold: true, color: "FFFFFF", size: 20, font: "Arial" })] })] });
+      children: [new TextRun({ text, bold: true, color: "FFFFFF", size: 20, font: "微软雅黑" })] })] });
 }
 function cell(text, width, shading) {
   const opts = { borders, width: { size: width, type: WidthType.DXA }, verticalAlign: VerticalAlign.CENTER,
     children: [new Paragraph({ spacing: { before: 40, after: 40 },
-      children: [new TextRun({ text: text || "", size: 20, font: "Arial" })] })] };
+      children: [new TextRun({ text: String(text || ""), size: 20, font: "微软雅黑" })] })] };
   if (shading) opts.shading = shading;
   return new TableCell(opts);
 }
@@ -1438,7 +1795,7 @@ function statusShading(cur, exp) { return cur === exp ? passShading : failShadin
 function heading(text, level) {
   return new Paragraph({ heading: level || HeadingLevel.HEADING_1,
     spacing: { before: 240, after: 120 },
-    children: [new TextRun({ text, font: "Arial" })] });
+    children: [new TextRun({ text, font: "微软雅黑" })] });
 }
 
 // -- Build sections --
@@ -1446,8 +1803,10 @@ const children = [];
 
 // Title
 children.push(new Paragraph({ heading: HeadingLevel.TITLE, alignment: AlignmentType.CENTER,
-  spacing: { before: 400, after: 200 },
-  children: [new TextRun({ text: "安全基线检查报告", bold: true, size: 44, font: "Arial" })] }));
+  spacing: { before: 400, after: 100 },
+  children: [new TextRun({ text: "安全基线检查报告", bold: true, size: 44, font: "微软雅黑" })] }));
+children.push(new Paragraph({ alignment: AlignmentType.CENTER, spacing: { after: 200 },
+  children: [new TextRun({ text: "等保三级合规检查  |  脚本版本: v" + data.version, size: 24, color: "666666", font: "微软雅黑" })] }));
 
 // Info table
 children.push(new Table({ columnWidths: [2400, 6960],
@@ -1459,6 +1818,26 @@ children.push(new Table({ columnWidths: [2400, 6960],
   ]
 }));
 children.push(new Paragraph({ children: [] }));
+
+// Compliance Summary
+children.push(heading("合规概览"));
+let scoreColor = failShading;
+if (data.score.pct >= 90) scoreColor = passShading;
+else if (data.score.pct >= 70) scoreColor = { fill: "FFF9C4", type: ShadingType.CLEAR }; // Yellow
+else if (data.score.pct >= 50) scoreColor = { fill: "FFE0B2", type: ShadingType.CLEAR }; // Orange
+
+children.push(new Table({ columnWidths: [2400, 2000, 1500, 1500, 1960],
+  rows: [
+    new TableRow({ children: [hdrCell("合规得分", 2400), hdrCell("评级", 2000), hdrCell("达标项", 1500), hdrCell("不达标", 1500), hdrCell("总项", 1960)] }),
+    new TableRow({ children: [
+        cell(data.score.pct + "%", 2400, scoreColor),
+        cell(data.score.level, 2000, scoreColor),
+        cell(data.score.pass, 1500),
+        cell(data.score.fail, 1500),
+        cell(data.score.total, 1960)
+    ]})
+  ]
+}));
 
 // 1. Password
 children.push(heading("1. 密码策略"));
@@ -1478,12 +1857,12 @@ children.push(new Table({ columnWidths: [2400, 2000, 2000, 2960],
   ]
 }));
 children.push(new Paragraph({ spacing: { before: 80 }, children: [
-  new TextRun({ text: "pam_pwquality: ", bold: true, size: 20, font: "Arial" }),
+  new TextRun({ text: "pam_pwquality: ", bold: true, size: 20, font: "微软雅黑" }),
   new TextRun({ text: data.password.pwquality, size: 18, font: "Courier New" })
 ]}));
 
 // 2. Login
-children.push(heading("2. 登录失败锁定"));
+children.push(heading("2. 登录限制"));
 children.push(new Table({ columnWidths: [2400, 6960],
   rows: [
     new TableRow({ children: [hdrCell("配置项",2400), hdrCell("当前值",6960)] }),
@@ -1493,7 +1872,7 @@ children.push(new Table({ columnWidths: [2400, 6960],
 }));
 
 // 3. SSH
-children.push(heading("3. SSH配置"));
+children.push(heading("3. SSH安全配置"));
 const sshTableRows = [new TableRow({ children: [hdrCell("配置项",3600), hdrCell("当前值",5760)] })];
 data.ssh.forEach((s,i) => sshTableRows.push(new TableRow({ children: [
   cell(s.key, 3600, i%2?altShading:undefined), cell(s.value, 5760, i%2?altShading:undefined)
@@ -1502,24 +1881,24 @@ children.push(new Table({ columnWidths: [3600, 5760], rows: sshTableRows }));
 
 // 4. Users
 children.push(heading("4. 用户账户"));
-children.push(new Paragraph({ spacing:{before:80}, children: [new TextRun({ text: "可登录用户:", bold: true, size: 20, font: "Arial" })] }));
+children.push(new Paragraph({ spacing:{before:80}, children: [new TextRun({ text: "可登录用户:", bold: true, size: 20, font: "微软雅黑" })] }));
 data.users.loginUsers.split(";").filter(Boolean).forEach(u => {
   children.push(new Paragraph({ indent: { left: 360 }, children: [new TextRun({ text: u.trim(), size: 20, font: "Courier New" })] }));
 });
 children.push(new Paragraph({ spacing:{before:80}, children: [
-  new TextRun({ text: "UID=0 用户: ", bold: true, size: 20, font: "Arial" }),
-  new TextRun({ text: data.users.uid0, size: 20, font: "Arial" })
+  new TextRun({ text: "UID=0 用户: ", bold: true, size: 20, font: "微软雅黑" }),
+  new TextRun({ text: data.users.uid0, size: 20, font: "微软雅黑" })
 ]}));
 
 // 5. umask
 children.push(heading("5. umask"));
 children.push(new Paragraph({ children: [
-  new TextRun({ text: "当前值: ", bold: true, size: 20, font: "Arial" }),
+  new TextRun({ text: "当前值: ", bold: true, size: 20, font: "微软雅黑" }),
   new TextRun({ text: data.umask, size: 20, font: "Courier New" })
 ]}));
 
 // 6. Audit
-children.push(heading("6. 审计服务"));
+children.push(heading("6. 安全审计"));
 children.push(new Table({ columnWidths: [3120, 3120, 3120],
   rows: [
     new TableRow({ children: [hdrCell("服务",3120), hdrCell("状态",3120), hdrCell("判定",3120)] }),
@@ -1530,12 +1909,12 @@ children.push(new Table({ columnWidths: [3120, 3120, 3120],
   ]
 }));
 children.push(new Paragraph({ spacing:{before:80}, children: [
-  new TextRun({ text: "HISTSIZE: ", bold: true, size: 20, font: "Arial" }),
+  new TextRun({ text: "HISTSIZE: ", bold: true, size: 20, font: "微软雅黑" }),
   new TextRun({ text: data.audit.histsize, size: 20, font: "Courier New" })
 ]}));
 
 // 7. File perms
-children.push(heading("7. 文件权限"));
+children.push(heading("7. 关键文件权限"));
 const fpRows = [new TableRow({ children: [hdrCell("权限",1800), hdrCell("文件路径",4200), hdrCell("期望值",1800), hdrCell("状态",1560)] })];
 data.filePerms.forEach((fp,i) => {
   const st = fp.expected==="-" || fp.perm===fp.expected ? "达标" : "不达标";
@@ -1567,7 +1946,7 @@ data.ports.split(";").filter(Boolean).forEach(line => {
 });
 
 // 10. AIDE
-children.push(heading("10. AIDE完整性校验"));
+children.push(heading("10. 完整性校验 (AIDE)"));
 children.push(new Table({ columnWidths: [4680, 4680],
   rows: [
     new TableRow({ children: [hdrCell("项目",4680), hdrCell("状态",4680)] }),
@@ -1577,35 +1956,103 @@ children.push(new Table({ columnWidths: [4680, 4680],
 }));
 
 // 11. hosts
-children.push(heading("11. hosts.allow/deny"));
-children.push(new Paragraph({ children: [new TextRun({ text: "hosts.allow: ", bold: true, size: 20, font: "Arial" }), new TextRun({ text: data.hosts.allow, size: 20, font: "Courier New" })] }));
-children.push(new Paragraph({ children: [new TextRun({ text: "hosts.deny: ", bold: true, size: 20, font: "Arial" }), new TextRun({ text: data.hosts.deny, size: 20, font: "Courier New" })] }));
+children.push(heading("11. 访问控制 (hosts.allow/deny)"));
+children.push(new Paragraph({ children: [new TextRun({ text: "hosts.allow: ", bold: true, size: 20, font: "微软雅黑" }), new TextRun({ text: data.hosts.allow, size: 20, font: "Courier New" })] }));
+children.push(new Paragraph({ children: [new TextRun({ text: "hosts.deny: ", bold: true, size: 20, font: "微软雅黑" }), new TextRun({ text: data.hosts.deny, size: 20, font: "Courier New" })] }));
+
+// 12. Firewall
+children.push(heading("12. 防火墙状态"));
+children.push(new Table({ columnWidths: [3120, 6240],
+  rows: [
+    new TableRow({ children: [hdrCell("项目", 3120), hdrCell("内容", 6240)] }),
+    new TableRow({ children: [cell("状态", 3120), cell(data.firewall.status, 6240, data.firewall.status==="active"?passShading:failShading)] }),
+    new TableRow({ children: [cell("规则预览", 3120, altShading), cell(data.firewall.rules, 6240, altShading)] }),
+  ]
+}));
+
+// 13. SELinux
+children.push(heading("13. SELinux状态"));
+children.push(new Paragraph({ children: [
+  new TextRun({ text: "当前模式: ", bold: true, size: 20, font: "微软雅黑" }),
+  new TextRun({ text: data.selinux, size: 20, font: "微软雅黑", color: data.selinux==="Disabled"?"FF0000":"000000" })
+]}));
+
+// 14. Sep Users
+children.push(heading("14. 三权分立用户"));
+children.push(new Table({ columnWidths: [2000, 2000, 2360, 3000],
+  rows: [
+    new TableRow({ children: [hdrCell("用户",2000), hdrCell("状态",2000), hdrCell("Shell",2360), hdrCell("密码过期时间",3000)] }),
+    ...data.sepUsers.map((u,i) => new TableRow({ children: [
+      cell(u.user, 2000, i%2?altShading:undefined),
+      cell(u.status, 2000, u.status==="存在"?passShading:failShading),
+      cell(u.shell, 2360, i%2?altShading:undefined),
+      cell(u.expire, 3000, i%2?altShading:undefined)
+    ]}))
+  ]
+}));
+
+// 15. SUID
+children.push(heading("15. 危险SUID文件"));
+data.suid.split(";").filter(Boolean).forEach(f => {
+  children.push(new Paragraph({ indent: { left: 360 }, children: [new TextRun({ text: f.trim(), size: 18, font: "Courier New" })] }));
+});
+
+// 16. PW Info
+children.push(heading("16. 用户密码过期信息"));
+children.push(new Table({ columnWidths: [2000, 1500, 2930, 2930],
+  rows: [
+    new TableRow({ children: [hdrCell("用户名",2000), hdrCell("UID",1500), hdrCell("上次修改",2930), hdrCell("过期时间",2930)] }),
+    ...data.pwInfo.map((p,i) => new TableRow({ children: [
+      cell(p.user, 2000, i%2?altShading:undefined), cell(p.uid, 1500, i%2?altShading:undefined),
+      cell(p.lastChange, 2930, i%2?altShading:undefined), cell(p.expire, 2930, i%2?altShading:undefined)
+    ]}))
+  ]
+}));
+
+// Recommendations
+children.push(heading("整改建议"));
+const recRows = [new TableRow({ children: [hdrCell("严重程度", 2000), hdrCell("建议内容", 7360)] })];
+data.recommendations.forEach((r,i) => {
+    let sh = undefined;
+    if (r.severity === "高") sh = { fill: "FFCDD2", type: ShadingType.CLEAR };
+    else if (r.severity === "中") sh = { fill: "FFF9C4", type: ShadingType.CLEAR };
+    else if (r.severity === "低") sh = { fill: "E8F5E9", type: ShadingType.CLEAR };
+
+    recRows.push(new TableRow({ children: [
+        cell(r.severity, 2000, sh),
+        cell(r.content, 7360, i%2 && !sh ? altShading : sh)
+    ]}));
+});
+if (data.recommendations.length === 0) {
+    recRows.push(new TableRow({ children: [cell("无", 2000), cell("所有检查项均已达标", 7360)] }));
+}
+children.push(new Table({ columnWidths: [2000, 7360], rows: recRows }));
 
 // Footer
 children.push(new Paragraph({ children: [] }));
 children.push(new Paragraph({ alignment: AlignmentType.CENTER, spacing: { before: 400 },
-  children: [new TextRun({ text: "报告由 security_kylin.sh v" + data.version + " 自动生成", italics: true, size: 18, color: "999999", font: "Arial" })] }));
+  children: [new TextRun({ text: "报告由 security_kylin.sh v" + data.version + " 自动生成", italics: true, size: 18, color: "999999", font: "微软雅黑" })] }));
 
 const doc = new Document({
   styles: {
-    default: { document: { run: { font: "Arial", size: 22 } } },
+    default: { document: { run: { font: "微软雅黑", size: 22 } } },
     paragraphStyles: [
       { id: "Title", name: "Title", basedOn: "Normal",
-        run: { size: 44, bold: true, font: "Arial" },
+        run: { size: 44, bold: true, font: "微软雅黑" },
         paragraph: { spacing: { before: 400, after: 200 }, alignment: AlignmentType.CENTER } },
       { id: "Heading1", name: "Heading 1", basedOn: "Normal", next: "Normal", quickFormat: true,
-        run: { size: 28, bold: true, color: "2B579A", font: "Arial" },
+        run: { size: 28, bold: true, color: "2B579A", font: "微软雅黑" },
         paragraph: { spacing: { before: 300, after: 120 }, outlineLevel: 0 } },
     ]
   },
   sections: [{
     properties: { page: { margin: { top: 1200, right: 1200, bottom: 1200, left: 1200 } } },
     headers: { default: new Header({ children: [new Paragraph({ alignment: AlignmentType.RIGHT,
-      children: [new TextRun({ text: "全员人口信息系统 - 安全基线检查", size: 16, color: "999999", font: "Arial" })] })] }) },
+      children: [new TextRun({ text: "全员人口信息系统 - 安全基线检查", size: 16, color: "999999", font: "微软雅黑" })] })] }) },
     footers: { default: new Footer({ children: [new Paragraph({ alignment: AlignmentType.CENTER,
-      children: [new TextRun({ text: "第 ", size: 16, font: "Arial" }), new TextRun({ children: [PageNumber.CURRENT], size: 16, font: "Arial" }),
-               new TextRun({ text: " 页 / 共 ", size: 16, font: "Arial" }), new TextRun({ children: [PageNumber.TOTAL_PAGES], size: 16, font: "Arial" }),
-               new TextRun({ text: " 页", size: 16, font: "Arial" })] })] }) },
+      children: [new TextRun({ text: "第 ", size: 16, font: "微软雅黑" }), new TextRun({ children: [PageNumber.CURRENT], size: 16, font: "微软雅黑" }),
+               new TextRun({ text: " 页 / 共 ", size: 16, font: "微软雅黑" }), new TextRun({ children: [PageNumber.TOTAL_PAGES], size: 16, font: "微软雅黑" }),
+               new TextRun({ text: " 页", size: 16, font: "微软雅黑" })] })] }) },
     children
   }]
 });
@@ -1777,8 +2224,27 @@ run_all() {
     separator
     echo ""
     log_ok "安全加固执行完成! (共执行 13 项)"
+    log_info "主机IP:   $HOST_IP"
     log_info "备份目录: $BACKUP_DIR"
+    log_info "报告目录: $REPORT_DIR"
     log_info "日志文件: $LOG_FILE"
+    echo ""
+
+    # 输出三权分立密码到控制台
+    if [[ -n "$ENV_FILE" && -f "$ENV_FILE" ]]; then
+        echo ""
+        log_warn "═══════════════════════════════════════════════════════════"
+        log_warn "  ★ 三权分立用户密码（首次登录后必须修改）"
+        log_warn "═══════════════════════════════════════════════════════════"
+        echo ""
+        echo -e "${Yellow}"
+        cat "$ENV_FILE"
+        echo -e "${Font}"
+        log_warn "  密码文件已保存到: $ENV_FILE"
+        log_warn "  请立即复制保存以上密码信息！部署完成后建议删除 .env 文件"
+        log_warn "═══════════════════════════════════════════════════════════"
+    fi
+
     echo ""
     log_warn "═══════════════════════════════════════════════════════════"
     log_warn "  以下 2 项未执行，需要从菜单手动选择:"
