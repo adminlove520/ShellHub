@@ -1,197 +1,202 @@
-## 基于iptables+Nginx封禁异常访问的IP
-### 脚本中各部分的详细解释
-- 1.设置起始时间和结束时间： 脚本通过使用date命令设置了起始时间和结束时间，起始时间为5分钟前，结束时间为当前时间。
-- 2.截取日志： 使用awk命令根据起始时间和结束时间从Nginx日志中截取出最近5分钟内的日志，并保存到临时文件tmp_last_minute.log中。
-- 3.提取IP地址： 使用awk命令从临时文件中提取出所有的IP地址，并保存到另一个临时文件tmp_last_minute_ip.log中。
-- 4.处理IP地址： 使用awk命令对IP地址进行处理，只保留前三位，并进行排序、去重和计数。然后根据设定的阈值（1500次），筛选出请求次数超过阈值的IP段，并将其保存到bad_ip_minute.list文件中。
-- 5.封禁IP地址： 当存在需要封禁的IP段时，使用iptables命令逐个封禁IP地址。首先，使用grep命令根据IP段提取出具体的IP地址，然后使用iptables命令将这些IP地址添加到封禁列表中。
-- 6.记录封禁的IP地址： 将被封禁的IP段记录到日志文件block_ip2.log中，包含封禁时间和被封禁的IP段。
-- 7.解封IP地址： 使用iptables命令清空计数器，等待2分钟。然后，检查请求次数小于5次的IP段，并将其记录到good_ip2.list文件中，标记为白名单IP。最后，使用iptables命令逐个解封白名单IP。
-- 8.记录解封的IP地址： 将被解封的IP地址记录到日志文件unblock_ip2.log中，包含解封时间和被解封的IP地址。
-### 使用方法
-- 1.脚本接受一个参数，即block或unblock，用于执行相应的功能。
-- 2.通过运行脚本并传入合适的参数，可以实现IP封禁和解封的操作。
+# ShellHub
+
+安全运维工具集 —— 集安全基线加固、应急响应、日常运维于一体的脚本仓库。
+
+## 目录结构
+
 ```
-### cron定时任务
-### 每5分钟执行一次block操作，每2小时执行一次unblock操作
-*/5 * * * * root /data/nginx/log/Block_IP_WAF.sh block
-0 */2 * * * root /data/nginx/log/Block_IP_WAF.sh unblock
+ShellHub/
+├── security/              # 安全基线加固
+│   ├── security_kylin.sh  # ★ 等保三级安全基线加固脚本 (麒麟V10)
+│   ├── security.sh        # 通用安全基线加固脚本 (CentOS/RHEL)
+│   ├── BaseLineCheck.sh   # Linux 基线检查脚本
+│   └── WindowsBaselineAssistant-v1.2.3.zip  # Windows 基线检查GUI工具
+├── emergency/             # 应急响应
+│   ├── LinuxCheck_V3.0.2.sh                 # Linux 应急处置/漏洞检测 v3.0.2
+│   ├── LinuxCheck - 应急响应实用脚本修改版.sh  # LinuxCheck 修改版 v3.2
+│   ├── AutoIncidentResponse.py              # 自动化应急分析 (Python)
+│   └── D-Eyes_1.3.0/                        # 绿盟D-Eyes应急响应工具
+├── ops/                   # 日常运维
+│   ├── AutoBanForNginx.sh   # Nginx异常IP自动封禁
+│   ├── AutoCreateUser.sh    # 批量创建用户
+│   ├── log_management.sh    # 日志管理与清理
+│   └── NginxCheck_v1.0.1.sh # Nginx日志分析
+└── docs/                  # 参考文档
+    └── 差距分析小结报告.doc
 ```
-## 一键批量创建用户并自动设置密码  
-- 1.接收用户名列表：脚本接收任意数量的用户名作为参数（$@表示所有传递给脚本的参数），并遍历这个列表。
 
-- 2.检查用户是否存在：使用id命令检查每个用户是否已经存在。如果用户不存在，则进入创建流程。
+---
 
-- 3.自动生成密码：脚本使用$RANDOM生成一个随机数，然后通过md5sum和cut命令生成一个8字符的密码。这种方法简单高效，适合快速生成安全密码。
+## security/ — 安全基线加固
 
-- 4.创建用户并设置密码：useradd命令用于创建新用户，passwd --stdin用于将生成的密码设置给用户。所有这些操作都是静默完成的，不会显示任何输出或错误。
+### security_kylin.sh ★ 主力脚本
 
-- 5.记录用户信息：脚本将新创建的用户名和对应的密码追加到一个名为user.info的文件中，方便后续查阅和管理。
+**适配系统**: Kylin Linux Advanced Server V10 (Halberd)  
+**等保标准**: GB/T 22239-2019 第三级  
+**依据文档**: 宁夏卫健委全员人口信息系统等保差距分析报告
 
-- 6.输出创建结果：每个用户的创建结果都会被打印到屏幕上，便于管理员了解创建情况。
-## 应急自动化分析脚本
-### 作者：Anonymous
-###  版本：v1.0
-- 应急自动化分析脚本，采用python2.0,主要是通过ssh远程登录实现常见命令查看，所以在使用之前需要输入正确的服务器ip、ssh连接端口、ssh登录用户名、ssh登录密码，
-主要实现如下功能:
-- 1、获取系统基本信息，ip地址，主机名称，版本；
-- 2、根据netstat、cpu占用率，获取异常程序pid，并定位异常所在路径；
-- 3、常见系统命令可能会被恶意文件替换修改，识别常见系统命令是否被修改；
-- 4、查看系统启动项目，根据时间排序，列出最近修改的前5个启动项
-- 5、查看历史命令，列出处存在可疑参数的命令；
-- 6、查看非系统用户；
-- 7、查看当前登录用户（tty 本地登陆  pts 远程登录）；
-- 8、通过查看passwd文件，确定系统当前用户
-- 9、查看crontab定时任务
-- 10、查看、保存最近三天系统文件修改情况
-- 11、查看passwd，存在哪些用户id为0的特权用户
-- 12、分析secure日志，判断其中是否存在异常ip地址
-- 上述所有操作均输出保存在log文件中
+#### 功能列表（15项 + 恢复）
 
-## 日志管理脚本
-### v1.0.1
-- 定时清空日志文件内容：当时间为0点或12点时，脚本将自动清空目标目录下的所有文件内容，但不删除文件本身。这样可以确保日志文件始终保持较小的体积，避免占用过多的存储空间。
+| 编号 | 命令 | 功能 | all执行 |
+|------|------|------|---------|
+| 1 | `password` | 密码策略加固 (复杂度/有效期/历史记录) | ✅ |
+| 2 | `login` | 登录失败锁定 (pam_faillock) + 会话超时 (TMOUT) | ✅ |
+| 3 | `ssh` | SSH安全加固 + Telnet禁用 | ⚠ 跳过 |
+| 4 | `hosts` | 网络访问控制 (hosts.allow/deny) | ⚠ 跳过 |
+| 5 | `users` | 三权分立用户 (系统/审计/安全管理员) | ✅ |
+| 6 | `umask` | umask权限掩码 (0027) | ✅ |
+| 7 | `audit` | 安全审计 (auditd规则 + 日志轮转保护) | ✅ |
+| 8 | `history` | 历史命令清除 (HISTSIZE=0) | ✅ |
+| 9 | `fileperm` | 关键文件权限加固 | ✅ |
+| 10 | `kernel` | 内核安全参数 (sysctl) | ✅ |
+| 11 | `services` | 不安全服务检查与关闭 | ✅ |
+| 12 | `aide` | AIDE完整性校验 (精简模式) | ✅ |
+| 13 | `accounts` | 多余/过期/空密码账户清理 | ✅ |
+| 14 | `backup` | 配置数据自动备份 | ✅ |
+| 15 | `report` | 安全状态检查报告 (txt/md/docx) | ✅ |
+| - | `restore` | 从备份恢复配置 | - |
 
-- 定时记录文件大小：在非清空时间，脚本将统计目标目录下各个文件的大小，并将结果输出到一个以时间和日期命名的日志文件中。这样你可以方便地查看各个日志文件的大小变化，及时发现异常增长或缩小的情况。
-- 1、保存脚本：首先``` git clone https://git.nxwysoft.com/HopeSecurity/ShellHub.git ```
+> ⚠ 第3/4项可能导致SSH断连，`all` 一键执行时自动跳过，需从菜单单独选择。
 
-- 2、赋予执行权限：在终端中，使用chmod +x log_management.sh命令为脚本赋予执行权限。
+#### 使用方法
 
-- 3、设置定时任务：你可以使用crontab命令设置定时任务，让脚本每小时执行一次。例如，在终端中输入crontab -e命令编辑定时任务，并添加以下行：0 * * * * /path/to/log_management.sh。这表示每小时的第0分钟执行一次脚本。
-## Linux应急处置脚本
-### v3.0.2
-Linux应急处置/信息搜集/漏洞检测工具，
-### 功能简述：
-- 基础配置
-- 网络流量
-- 任务计划
-- 环境变量
-- 用户信息
-- Services
-- bash
-- 恶意文件
-- 内核Rootkit
-- SSH
-- Webshell
-- 挖矿文件
-- 挖矿进程
-- 供应链
-- 服务器风险等13类70+项检查；
-### 功能列表
-* 基础配置检查
-    * 系统配置改动检查
-    * 系统信息（IP地址/用户/开机时间/系统版本/Hostname/服务器SN）
-    * CPU使用率
-    * 登录用户信息
-    * CPU TOP 15
-    * 内存 TOP 15
-    * 磁盘剩余空间检查
-    * 硬盘挂载
-    * 常用软件检查
-    * /etc/hots
-* 网络/流量检查
-    * ifconfig
-    * 网络流量
-    * 端口监听
-    * 对外开放端口
-    * 网络连接
-    * TCP连接状态
-    * 路由表
-    * 路由转发
-    * DNS Server
-    * ARP
-    * 网卡混杂模式检查
-    * iptables 防火墙
-* 任务计划检查
-    * 当前用户任务计划
-    * /etc/系统任务计划
-    * 任务计划文件创建时间
-    * crontab 后门排查
-* 环境变量检查
-    * env
-    * path
-    * LD_PRELOAD
-    * LD_ELF_PRELOAD
-    * LD_AOUT_PRELOAD
-    * PROMPT_COMMAND
-    * LD_LIBRARY_PATH
-    * ld.so.preload
-* 用户信息检查
-    * 可登陆用户
-    * passwd文件修改日期
-    * sudoers
-    * 登录信息（w/last/lastlog）
-    * 历史登陆ip
-* Services 检查
-    * SystemD运行服务
-    * SystemD服务创建时间
-* bash检查
-    * History
-    * History命令审计
-    * /etc/profile
-    * $HOME/.profile
-    * /etc/rc.local
-    * ~/.bash_profile
-    * ~/.bashrc
-    * bash反弹shell
-* 文件检查
-    * ...隐藏文件
-    * 系统文件修改时间检测
-    * 临时文件检查（/tmp /var/tmp /dev/shm）
-    * alias
-    * suid特殊权限检查
-    * 进程存在文件未找到
-    * 近七天文件改动 mtime
-    * 近七天文件改动 ctime
-    * 大文件>200mb
-    * 敏感文件审计（nmap/sqlmap/ew/frp/nps等黑客常用工具）
-    * 可疑黑客文件（黑客上传的wget/curl等程序，或者将恶意程序改成正常软件例如nps文件改为mysql）
-* 内核Rootkit 检查
-    * lsmod 可疑模块
-    * 内核符号表检查
-    * rootkit hunter 检查
-    * rootkit .ko模块检查
-* SSH检查
-    * SSH 爆破
-    * SSHD 检测
-    * SSH 后门配置
-    * SSH inetd后门检查
-    * SSH key
-* Webshell 检查
-    * php webshell检查
-    * jsp webshell检查
-* 挖矿文件/进程检查
-    * 挖矿文件检查
-    * 挖矿进程检查
-    * WorkMiner检测
-    * Ntpclient检测
-* 供应链投毒检查
-    * Python PIP 投毒检查
-* 服务器风险检查
-    * Redis弱密码检测
-    * JDWP 服务检测
-    * Python http.server 检测
-* Docker 权限检查
+```bash
+# 查看帮助
+bash security_kylin.sh --help
 
-## 绿盟应急响应工具(Linux&Windows)
-### V1.0.1
-- [说明文件](./绿盟应急响应工具D-Eyes_1.1.0/README.MD)
-- [Github仓库](https://github.com/m-sec-org/d-eyes)
-- 注意：最新版本为1.3.0；使用前请及时更新
-## LinuxCheck - 应急响应实用脚本修改版
-### V3.2
-- checkList
-    - base_check
-    - network_check
-    - crontab_check
-    - env_check
-    - user_check
-    - service_check
-    - bash_check
-    - file_check
-    - rootkit_check
-    - ssh_check
-    - webshell_check
-    - poison_check
-    - miner_check
-    - risk_check
+# 交互式菜单
+bash security_kylin.sh
+
+# 一键加固（安全，跳过SSH/hosts）
+bash security_kylin.sh all
+
+# 单项执行
+bash security_kylin.sh password
+bash security_kylin.sh ssh         # 会二次确认
+
+# 生成检查报告
+bash security_kylin.sh report          # 全部格式 (txt+md+docx)
+bash security_kylin.sh report md       # 仅Markdown
+bash security_kylin.sh report docx     # 仅Word文档
+
+# 恢复配置
+bash security_kylin.sh restore         # 交互式选择备份
+bash security_kylin.sh restore 20260416_155137  # 指定时间点
+```
+
+#### 输出路径
+
+| 类型 | 路径 |
+|------|------|
+| 检查报告 | `/root/security_reports/security_check_<时间戳>.[txt\|md\|docx]` |
+| 执行日志 | `/var/log/security_harden.log` |
+| 配置备份 | `/root/security_backup/<时间戳>/` (保留完整目录结构) |
+| 密码文件 | `/root/security_backup/<时间戳>/passwords.txt` |
+
+#### 推荐流程
+
+```
+1. bash security_kylin.sh all              # 一键加固 13 项
+2. 用 sysadmin 用户测试 SSH 登录
+3. bash security_kylin.sh ssh              # SSH加固
+4. bash security_kylin.sh hosts            # hosts访问控制
+5. bash security_kylin.sh report           # 生成报告留存
+```
+
+### security.sh
+
+通用版安全基线加固脚本（CentOS/RHEL），`security_kylin.sh` 的前身。
+
+### BaseLineCheck.sh
+
+Linux 安全基线检查脚本，仅检查不修改，输出检查报告。
+
+### WindowsBaselineAssistant-v1.2.3.zip
+
+Windows 基线安全检查 GUI 工具。
+
+---
+
+## emergency/ — 应急响应
+
+### LinuxCheck_V3.0.2.sh
+
+Linux 应急处置/信息搜集/漏洞检测工具，覆盖 13 类 70+ 项检查：
+
+- 基础配置、网络流量、任务计划、环境变量
+- 用户信息、Services、bash 检查
+- 恶意文件、内核 Rootkit、SSH
+- Webshell、挖矿检测、供应链投毒
+- 服务器风险、Docker 权限
+
+### LinuxCheck - 应急响应实用脚本修改版.sh
+
+LinuxCheck v3.2 修改版，在原版基础上增强了检查项。
+
+### AutoIncidentResponse.py
+
+Python 自动化应急分析工具（v1.0），通过 SSH 远程连接执行检查：
+
+- 系统基本信息、异常进程定位
+- 系统命令篡改检测、启动项检查
+- 可疑历史命令、非系统用户检查
+- crontab 定时任务、近三天文件修改
+- 特权用户检查、secure 日志分析
+
+### D-Eyes_1.3.0/
+
+绿盟科技应急响应工具，支持 Linux 和 Windows。  
+仓库: [github.com/m-sec-org/d-eyes](https://github.com/m-sec-org/d-eyes)
+
+---
+
+## ops/ — 日常运维
+
+### AutoBanForNginx.sh
+
+基于 iptables + Nginx 日志的异常IP自动封禁/解封：
+
+```bash
+# cron 定时任务
+*/5 * * * * root /path/to/AutoBanForNginx.sh block     # 每5分钟封禁
+0 */2 * * * root /path/to/AutoBanForNginx.sh unblock   # 每2小时解封
+```
+
+### AutoCreateUser.sh
+
+一键批量创建用户并自动生成密码，结果保存到 `user.info`：
+
+```bash
+bash AutoCreateUser.sh user1 user2 user3
+```
+
+### log_management.sh
+
+日志管理脚本：
+- 0 点和 12 点自动清空日志内容（保留文件）
+- 其他时间统计并记录各日志文件大小
+
+```bash
+# cron 定时任务：每小时执行
+0 * * * * /path/to/log_management.sh
+```
+
+### NginxCheck_v1.0.1.sh
+
+Nginx 日志分析脚本（v1.0.1），统计访问量、异常请求、IP 排行等。
+
+---
+
+## 环境要求
+
+| 脚本 | 系统要求 | 依赖 |
+|------|---------|------|
+| security_kylin.sh | Kylin V10 / CentOS 7+ | bash, systemd |
+| security_kylin.sh report docx | 同上 | Node.js + docx 模块 |
+| security_kylin.sh aide | 同上 | aide (`yum install aide`) |
+| AutoIncidentResponse.py | 任意 (远程执行) | Python 2, paramiko |
+| 其他 .sh 脚本 | CentOS / RHEL / Kylin | bash |
+
+## 许可
+
+内部使用
