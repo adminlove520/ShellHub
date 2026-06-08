@@ -1,0 +1,25 @@
+# 巡检报告 (含真实主机名 / IP / 域信息)
+Inspection_*.html
+Inspection_*.docx
+Inspection_*.md
+
+# 真实环境的主机列表（含 FQDN / IP）
+servers.txt
+
+# 微信公众号文章（本地预览用，不入仓）
+wechat_article.html
+wechat_*.html
+
+# Word 临时锁文件
+~$*.docx
+~$*.doc
+
+# OS / IDE
+Thumbs.db
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*.bak
+*.tmp
+*.log

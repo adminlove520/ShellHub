@@ -1,0 +1,14 @@
+# 一行一个主机名或 IP，# 开头的行是注释
+# 把这个文件复制为 servers.txt 再修改，servers.txt 已被 .gitignore 排除
+
+# 域内 FQDN
+server01.contoso.com
+server02.contoso.com
+
+# 或直接用 IP
+10.0.0.10
+10.0.0.11
+
+# 或 NetBIOS 名
+DC01
+DC02
