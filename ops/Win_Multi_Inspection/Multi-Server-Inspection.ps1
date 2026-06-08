@@ -24,11 +24,11 @@
     需要被巡检机开通 WinRM (5985) 或 DCOM (135 + 动态)。同域账户最简单。
 #>
 
-[CmdletBinding(DefaultParameterSetName='List')]
+[CmdletBinding(DefaultParameterSetName='Default')]
 param(
-    [Parameter(ParameterSetName='Inline', Mandatory=$true)]
+    [Parameter(ParameterSetName='Inline')]
     [string[]] $Servers,
-    [Parameter(ParameterSetName='File', Mandatory=$true)]
+    [Parameter(ParameterSetName='File')]
     [string]   $ServerListFile,
     [System.Management.Automation.PSCredential] $Credential,
     [string] $OutDir,
@@ -44,14 +44,18 @@ try { chcp 65001 > $null } catch {}
 # ==================== 主机列表 ====================
 $LocalMode = $false
 if ($PSCmdlet.ParameterSetName -eq 'File') {
-    if (-not (Test-Path $ServerListFile)) {
+    if (Test-Path $ServerListFile) {
+        $Servers = Get-Content $ServerListFile | Where-Object { $_ -and $_.Trim() -and -not $_.Trim().StartsWith('#') } | ForEach-Object { $_.Trim() }
+    } else {
         # 文件不存在 → 自动切换为单机本机巡检
         $LocalMode = $true
         $Servers = @($env:COMPUTERNAME)
         Write-Host "未找到 $ServerListFile，自动进入单机本机巡检模式" -ForegroundColor Yellow
-    } else {
-        $Servers = Get-Content $ServerListFile | Where-Object { $_ -and $_.Trim() -and -not $_.Trim().StartsWith('#') } | ForEach-Object { $_.Trim() }
     }
+} elseif ($PSCmdlet.ParameterSetName -eq 'Default') {
+    # 无任何参数 → 默认单机本机巡检
+    $LocalMode = $true
+    $Servers = @($env:COMPUTERNAME)
 }
 $Servers = $Servers | Where-Object { $_ } | Select-Object -Unique
 if (-not $Servers -or $Servers.Count -eq 0) { throw "主机列表为空" }

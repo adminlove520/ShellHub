@@ -40,17 +40,17 @@
 ### 安装
 
 ```powershell
-git clone https://github.com/adminlove520/ShellHub
-cd ops/Win_Multi_Inspection
+git clone https://github.com/adminlove520/Win_Multi_Inspection.git
+cd Win_Multi_Inspection
 ```
 
 ### 用法
 
 ```powershell
-# ★ 默认单机巡检（自动采集本机，不需任何文件）
-.\Multi-Server-Inspection.ps1 -ServerListFile .\servers.txt
+# ★ 默认单机巡检（直接运行，自动采集本机）
+.\Multi-Server-Inspection.ps1
 
-# 多机巡检（每行一个主机名，# 开头为注释）
+# 多机巡检（每行一个主机名，# 开头为注释；文件不存在时自动降级单机）
 .\Multi-Server-Inspection.ps1 -ServerListFile .\servers.txt
 
 # 单行命令指定多台主机
@@ -127,7 +127,7 @@ Register-ScheduledTask -TaskName 'WeeklyServerInspection' -Trigger $trigger -Act
 
 ```
 Win_Multi_Inspection/
-├── Multi-Server-Inspection.ps1   # 主脚本（多机巡检）
+├── Multi-Server-Inspection.ps1   # 主脚本（单机/多机巡检）
 ├── Convert-HtmlToDocx.ps1       # HTML→Word 转换工具
 ├── servers.txt.example           # 主机列表模板
 ├── CHANGELOG.md                  # 版本更新日志
