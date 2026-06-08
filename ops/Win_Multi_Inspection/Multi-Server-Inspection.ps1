@@ -42,9 +42,16 @@ try { [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false } c
 try { chcp 65001 > $null } catch {}
 
 # ==================== 主机列表 ====================
+$LocalMode = $false
 if ($PSCmdlet.ParameterSetName -eq 'File') {
-    if (-not (Test-Path $ServerListFile)) { throw "找不到列表文件: $ServerListFile" }
-    $Servers = Get-Content $ServerListFile | Where-Object { $_ -and $_.Trim() -and -not $_.Trim().StartsWith('#') } | ForEach-Object { $_.Trim() }
+    if (-not (Test-Path $ServerListFile)) {
+        # 文件不存在 → 自动切换为单机本机巡检
+        $LocalMode = $true
+        $Servers = @($env:COMPUTERNAME)
+        Write-Host "未找到 $ServerListFile，自动进入单机本机巡检模式" -ForegroundColor Yellow
+    } else {
+        $Servers = Get-Content $ServerListFile | Where-Object { $_ -and $_.Trim() -and -not $_.Trim().StartsWith('#') } | ForEach-Object { $_.Trim() }
+    }
 }
 $Servers = $Servers | Where-Object { $_ } | Select-Object -Unique
 if (-not $Servers -or $Servers.Count -eq 0) { throw "主机列表为空" }
@@ -55,7 +62,8 @@ if (-not $OutDir) {
 if (-not (Test-Path $OutDir)) { New-Item -ItemType Directory -Path $OutDir -Force | Out-Null }
 
 Write-Host ('=' * 60)
-Write-Host "  Windows 多机巡检 (CPU / 内存 / 磁盘)"
+$headline = if ($LocalMode) { "Windows 本机巡检 (CPU / 内存 / 磁盘)" } else { "Windows 多机巡检 (CPU / 内存 / 磁盘)" }
+Write-Host "  $headline"
 Write-Host ('=' * 60)
 Write-Host "目标主机数: $($Servers.Count)" -ForegroundColor Cyan
 Write-Host "并行上限: $ThrottleLimit"
@@ -63,7 +71,7 @@ Write-Host "输出目录: $OutDir`n"
 
 # ==================== 采集函数（在 Job 里跑） ====================
 $collectBlock = {
-    param($Target, $Cred)
+    param($Target, $Cred, $IsLocal)
 
     $r = [ordered]@{
         target    = $Target
@@ -86,40 +94,46 @@ $collectBlock = {
         physical = @()
     }
 
-    # 1. ICMP 快速预探
-    if (-not (Test-Connection -ComputerName $Target -Count 1 -Quiet -EA SilentlyContinue)) {
-        $r.error = 'ICMP 不通'
-        return [pscustomobject]$r
-    }
-
-    # 2. 建立 CIM Session：先试 WSMan（WinRM 5985），失败回退 DCOM (Win32 旧版)
-    $cimSession = $null
-    $sessionOpts = $null
-    foreach ($proto in @('Wsman','Dcom')) {
-        try {
-            $sessionOpts = New-CimSessionOption -Protocol $proto
-            $params = @{
-                ComputerName  = $Target
-                SessionOption = $sessionOpts
-                OperationTimeoutSec = 25
-                ErrorAction   = 'Stop'
-            }
-            if ($Cred) { $params.Credential = $Cred }
-            $cimSession = New-CimSession @params
-            if ($cimSession) { break }
-        } catch {
-            $cimSession = $null
-            $lastErr = $_.Exception.Message
+    # 1. ICMP 快速预探（单机模式跳过）
+    if (-not $IsLocal) {
+        if (-not (Test-Connection -ComputerName $Target -Count 1 -Quiet -EA SilentlyContinue)) {
+            $r.error = 'ICMP 不通'
+            return [pscustomobject]$r
         }
     }
-    if (-not $cimSession) {
-        $r.error = "CIM 连接失败: $lastErr"
-        return [pscustomobject]$r
+
+    # 2. 建立 CIM Session（单机模式跳过，直接用本地 WMI）
+    $cimSession = $null
+    $cimParams = @{}
+    if (-not $IsLocal) {
+        $sessionOpts = $null
+        foreach ($proto in @('Wsman','Dcom')) {
+            try {
+                $sessionOpts = New-CimSessionOption -Protocol $proto
+                $params = @{
+                    ComputerName  = $Target
+                    SessionOption = $sessionOpts
+                    OperationTimeoutSec = 25
+                    ErrorAction   = 'Stop'
+                }
+                if ($Cred) { $params.Credential = $Cred }
+                $cimSession = New-CimSession @params
+                if ($cimSession) { break }
+            } catch {
+                $cimSession = $null
+                $lastErr = $_.Exception.Message
+            }
+        }
+        if (-not $cimSession) {
+            $r.error = "CIM 连接失败: $lastErr"
+            return [pscustomobject]$r
+        }
+        $cimParams.CimSession = $cimSession
     }
 
     try {
         # 3. OS / 主机名 / 内存
-        $os = Get-CimInstance Win32_OperatingSystem -CimSession $cimSession -EA Stop
+        $os = Get-CimInstance Win32_OperatingSystem @cimParams -EA Stop
         $r.hostname = $os.CSName
         $r.os = "$($os.Caption) (Build $($os.BuildNumber))"
         $boot = $os.LastBootUpTime
@@ -134,7 +148,7 @@ $collectBlock = {
         $r.mem_pct      = if ($r.mem_total_gb -gt 0) { [math]::Round($r.mem_used_gb / $r.mem_total_gb * 100, 1) } else { 0 }
 
         # 4. CPU
-        $cpus = @(Get-CimInstance Win32_Processor -CimSession $cimSession -EA Stop)
+        $cpus = @(Get-CimInstance Win32_Processor @cimParams -EA Stop)
         if ($cpus.Count -gt 0) {
             $r.cpu_name = $cpus[0].Name.Trim()
             if ($cpus.Count -gt 1) { $r.cpu_name = "$($r.cpu_name) × $($cpus.Count)" }
@@ -144,7 +158,7 @@ $collectBlock = {
         # CPU 负载：连采 3 次取平均（每次间隔 1 秒），更稳定
         $samples = @()
         for ($i = 0; $i -lt 3; $i++) {
-            $procs = Get-CimInstance Win32_Processor -CimSession $cimSession -EA SilentlyContinue
+            $procs = Get-CimInstance Win32_Processor @cimParams -EA SilentlyContinue
             if ($procs) {
                 $avg = ($procs | Measure-Object LoadPercentage -Average).Average
                 if ($null -ne $avg) { $samples += [int][math]::Round($avg) }
@@ -155,7 +169,7 @@ $collectBlock = {
         $r.cpu_load_pct = if ($samples.Count -gt 0) { [int][math]::Round(($samples | Measure-Object -Average).Average) } else { 0 }
 
         # 5. 逻辑磁盘
-        $logical = Get-CimInstance Win32_LogicalDisk -CimSession $cimSession -Filter 'DriveType=3' -EA SilentlyContinue
+        $logical = Get-CimInstance Win32_LogicalDisk @cimParams -Filter 'DriveType=3' -EA SilentlyContinue
         foreach ($d in $logical) {
             $totalGB = if ($d.Size) { [math]::Round($d.Size / 1GB, 2) } else { 0 }
             $freeGB  = if ($d.FreeSpace) { [math]::Round($d.FreeSpace / 1GB, 2) } else { 0 }
@@ -174,7 +188,7 @@ $collectBlock = {
 
         # 6. 物理磁盘（如果支持 Storage Module）
         try {
-            $phys = Get-CimInstance -CimSession $cimSession -ClassName MSFT_PhysicalDisk -Namespace 'root\Microsoft\Windows\Storage' -EA Stop
+            $phys = Get-CimInstance @cimParams -ClassName MSFT_PhysicalDisk -Namespace 'root\Microsoft\Windows\Storage' -EA Stop
             foreach ($p in $phys) {
                 $r.physical += [ordered]@{
                     name   = $p.FriendlyName
@@ -222,7 +236,7 @@ foreach ($target in $Servers) {
     $r = $null
     try {
         # 直接在主进程调用 ScriptBlock，避开 Background Job 的 PSRP 序列化
-        $r = & $collectBlock $target $Credential
+        $r = & $collectBlock $target $Credential $LocalMode
     } catch {
         $r = New-EmptyResult $target ("采集异常: " + $_.Exception.Message)
     }
@@ -278,12 +292,18 @@ function MetaIcon($kind) {
 $ts = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
 $today = (Get-Date).ToString('yyyy-MM-dd')
 $accountStr = if ($Credential) { $Credential.UserName } else { "$env:USERDOMAIN\$env:USERNAME" }
+$reportTitle = if ($LocalMode) { '本机巡检报告' } else { '多机巡检报告' }
+$introText   = if ($LocalMode) {
+    '通过 WMI/CIM 直接采集本机 CPU、内存、磁盘指标，自动评估资源风险（≥90% 高危 / ≥70%~80% 中等），生成 HTML + Word 巡检报告。'
+} else {
+    '通过 <strong>WinRM / DCOM</strong> 远程采集 Windows 服务器的 CPU、内存、磁盘指标，自动评估资源风险（≥90% 高危 / ≥70%~80% 中等），生成 HTML + Word 巡检报告。'
+}
 $sb = New-Object System.Text.StringBuilder
 
 [void]$sb.Append(@"
 <!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="UTF-8">
-<title>Windows 多机巡检报告 - $today</title>
+<title>Windows $reportTitle - $today</title>
 <style>
 * { box-sizing: border-box; }
 body { font-family: -apple-system,'微软雅黑','Microsoft YaHei','Segoe UI',sans-serif; font-size: 13px; color: #1f2937; line-height: 1.55; background: #f5f7fa; margin: 0; padding: 28px 40px; }
@@ -411,12 +431,12 @@ code { font-family: Consolas,'Courier New',monospace; background:#f1f4f8; paddin
 </style></head><body>
 
 <div class="page-head">
-  <h1>Windows 多机巡检报告</h1>
+  <h1>Windows $reportTitle</h1>
   <div class="head-ts">报告生成时间:<b>$ts</b></div>
 </div>
 
 <div class="card">
-  <p class="intro-text">通过 <strong>WinRM / DCOM</strong> 远程采集 Windows 服务器的 CPU、内存、磁盘指标，自动评估资源风险（≥90% 高危 / ≥70%~80% 中等），生成 HTML + Word 巡检报告。</p>
+  <p class="intro-text">$introText</p>
   <div class="intro-divider"></div>
   <div class="meta-grid">
     <div class="mi">$(MetaIcon 'date')<div class="mi-text"><div class="mi-label">巡检日期</div><div class="mi-value">$today</div></div></div>
