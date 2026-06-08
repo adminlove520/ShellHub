@@ -12,23 +12,19 @@
 
 ```
 ============================================================
-  Windows 多机巡检 (CPU / 内存 / 磁盘)
+  Windows 本机巡检 (CPU / 内存 / 磁盘)
 ============================================================
-目标主机数: 5
+目标主机数: 1
 并行上限: 8
 输出目录: D:\巡检报告
 
-  [ 1/ 5] dc01.contoso.com               OK (8.2s)
-  [ 2/ 5] dc02.contoso.com               OK (9.1s)
-  [ 3/ 5] 10.0.0.10                      OK (7.8s)
-  [ 4/ 5] dfs01.contoso.com              FAIL (5.1s) - ICMP 不通
-  [ 5/ 5] ddc01.contoso.com              OK (8.5s)
+  [ 1/ 1] LAPTOP-SUNCTJEG            OK (8.6s)
 
-采集耗时: 39.7 秒，共 5 条结果
+采集耗时: 8.6 秒，共 1 条结果
 
 正在生成 HTML 报告 ...
 正在转换 DOCX ...
-完成: D:\巡检报告\Inspection_20260608_143000.docx
+完成: D:\巡检报告\Inspection_20260608_173723.docx
 ```
 
 ---
@@ -51,22 +47,24 @@ cd ops/Win_Multi_Inspection
 ### 用法
 
 ```powershell
-# 单行命令（指定主机）
-.\Multi-Server-Inspection.ps1 -Servers @('dc01','dc02','dfs01','ddc01','ddc02')
-
-# 从主机列表文件读取（每行一个主机名或 IP，# 开头的行是注释）
-Copy-Item servers.txt.example servers.txt   # 复制并编辑
+# ★ 默认单机巡检（自动采集本机，不需任何文件）
 .\Multi-Server-Inspection.ps1 -ServerListFile .\servers.txt
+
+# 多机巡检（每行一个主机名，# 开头为注释）
+.\Multi-Server-Inspection.ps1 -ServerListFile .\servers.txt
+
+# 单行命令指定多台主机
+.\Multi-Server-Inspection.ps1 -Servers @('dc01','dc02','dfs01')
 
 # 跨域/工作组指定凭据
 $cred = Get-Credential
 .\Multi-Server-Inspection.ps1 -ServerListFile .\servers.txt -Credential $cred
 
 # 调整并行上限（默认 8）
-.\Multi-Server-Inspection.ps1 -Servers @('s1','s2') -ThrottleLimit 4
+.\Multi-Server-Inspection.ps1 -ServerListFile .\servers.txt -ThrottleLimit 4
 
 # 只生成 HTML（未安装 Word 时使用）
-.\Multi-Server-Inspection.ps1 -Servers @('s1','s2') -NoWord
+.\Multi-Server-Inspection.ps1 -ServerListFile .\servers.txt -NoWord
 
 # 自定义输出目录
 .\Multi-Server-Inspection.ps1 -ServerListFile .\servers.txt -OutDir D:\Reports\20260608
@@ -79,7 +77,7 @@ $cred = Get-Credential
 | 参数 | 说明 |
 |---|---|
 | `-Servers <string[]>` | 主机名/IP 数组，与 `-ServerListFile` 二选一 |
-| `-ServerListFile <string>` | 主机列表文件路径，每行一个，`#` 开头为注释 |
+| `-ServerListFile <string>` | 主机列表文件路径，每行一个，`#` 开头为注释。<br>文件不存在时自动切换为**单机本机巡检** |
 | `-Credential <PSCredential>` | 凭据（跨域/工作组必填）：`Get-Credential` |
 | `-OutDir <string>` | 输出目录（默认脚本所在目录） |
 | `-ThrottleLimit <int>` | 并行 Job 上限（默认 8） |
